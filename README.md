@@ -1,8 +1,10 @@
-# 项目环境设置指南
+# multimodal-llm-workshop
 
-## 创建虚拟环境
+## 项目环境设置指南
 
-### 方法一：使用 venv（推荐）
+### 创建虚拟环境
+
+#### 方法一：使用 venv（推荐）
 
 ```bash
 # 创建虚拟环境
@@ -15,7 +17,7 @@ source .venv/bin/activate
 # .venv\Scripts\activate
 ```
 
-### 方法二：使用 conda
+#### 方法二：使用 conda
 
 ```bash
 # 创建虚拟环境
@@ -25,7 +27,7 @@ conda create -n multimodal-env python=3.10
 conda activate multimodal-env
 ```
 
-## 安装依赖
+### 安装依赖
 
 ```bash
 pip install --upgrade pip
@@ -39,13 +41,13 @@ pip install datasets
 pip install jupyter notebook
 ```
 
-## 运行项目(更新中)
+### 运行项目(更新中)
 
 ```bash
 
 ```
 
-## 验证安装
+### 验证安装
 
 ```python
 # 在 Python 中测试关键包是否正常导入
