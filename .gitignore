@@ -2,7 +2,17 @@
 venv/
 .venv/
 
+# data
+/core/data
+# models
+/core/models
+
 # outpus
 /outputs
 /module/module_01/outputs
 /module/module_02/outputs
+
+# cache
+/module/module_01/__pycache__/
+/module/module_01/src/__pycache__/
+/module/module_02/__pycache__/
