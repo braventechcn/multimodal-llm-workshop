@@ -16,3 +16,4 @@ venv/
 /module/module_01/__pycache__/
 /module/module_01/src/__pycache__/
 /module/module_02/__pycache__/
+/module/module_02/src/__pycache__/
