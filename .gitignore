@@ -3,7 +3,7 @@ venv/
 .venv/
 
 # data
-/core/data/
+/core/datas/
 # models
 /core/models
 
