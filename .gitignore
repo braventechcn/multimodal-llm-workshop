@@ -3,14 +3,14 @@ venv/
 .venv/
 
 # data
-/core/data
+/core/data/
 # models
 /core/models
 
 # outpus
-/outputs
-/module/module_01/outputs
-/module/module_02/outputs
+/outputs/
+/module/module_01/outputs/
+/module/module_02/outputs/
 
 # cache
 /module/module_01/__pycache__/
