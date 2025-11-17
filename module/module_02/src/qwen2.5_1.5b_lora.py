@@ -20,12 +20,15 @@ CONFIG = {
     "test_data_path": "/home/wyj/workspace/multimodal-llm-workshop/core/datas/module_02/bank_intent_data/test.jsonl",    # Test set path（仅最终评估使用，训练过程中绝不触碰，避免数据泄露）
     "lora_save_path": "/home/wyj/workspace/multimodal-llm-workshop/module/module_02/outputs/bank_lora_model",                # LoRA weights save path (all files stored together)
     "labels": ["fraud_risk", "refund", "balance", "card_lost", "other"],  # Intent label list
-    "max_seq_len": 64,  # Maximum text truncation length (adapted to corpus length distribution)
-    "batch_size": 1,  # Batch size (to avoid Qwen pad_token compatibility issues)
-    "epochs": 1,  # Number of training epochs (balance fitting effsect and overfitting risk)
-    "lr": 2e-5,  # LoRA learning rate (based on Qwen-1.5B optimal empirical value)
-    "gradient_accumulation_steps": 1,  # 为后续扩大有效批次作准备（默认=1不改变现有行为）
-    "seed": 42  # 设定随机种子保证可复现
+    "max_seq_len": 64,      # Maximum text truncation length (adapted to corpus length distribution)
+    "train_batch_size": 8,  # Training batch size (based on GPU memory capacity)
+    "eval_batch_size": 8,    # Validation batch size (can be larger to speed up evaluation)
+    "test_batch_size": 8,   # Test batch size (can be larger to speed up evaluation)
+    "batch_size": 8,        # Unified batch size for training and evaluation (for simplicity)
+    "epochs": 1,            # Number of training epochs (balance fitting effsect and overfitting risk)
+    "gradient_accumulation_steps": 1,  # Gradient accumulation steps (default=1, no change to existing logic)
+    "lr": 2e-5,             # LoRA learning rate (based on Qwen-1.5B optimal empirical value)
+    "seed": 42              # Random seed for reproducibility
 }
 
 # Config GPU Devices (Single GPU Environment, Multi-GPU can adjust accordingly, e.g. ["0,1"])
@@ -40,18 +43,20 @@ id2label = {idx: label for idx, label in enumerate(CONFIG["labels"])}
 
 # Data loading and processing
 def load_and_process_data():
-    """加载并处理训练/验证/测试数据集。
-
-    重要数据泄露说明：
-    - 训练阶段只使用 train + validation；validation 用于监控与选择最优权重。
-    - test 集仅在所有参数与模型确定后进行一次最终评估，严格避免在训练过程中引入任何 test 信息。
     """
-    # 使用更明确的 data_files 字典 + split 名称，避免语义混淆
+    Load and preprocess dataset.
+    Data Splitting Principles:
+        - Only the training phase uses train + validation set; validation set is used for monitoring and selecting the best weights.
+        - Test Set is only used for a final evaluation after all parameters and models are determined, strictly avoiding any test information leakage during training.
+    """
+    # Use a more explicit data_files dictionary + split names to avoid semantic confusion
     train_ds = load_dataset("json", data_files={"train": CONFIG["train_data_path"]}, split="train")
     val_ds = load_dataset("json", data_files={"validation": CONFIG["val_data_path"]}, split="validation")
     test_ds = load_dataset("json", data_files={"test": CONFIG["test_data_path"]}, split="test")
 
-    # 数据清洗：过滤标签不在预设集合的样本，并映射到 id（保持原批处理逻辑，不改变核心行为）
+    # Data Cleaning: 
+    # - Filter out samples with labels not in the predefined set
+    # - and map to id (maintain original batch processing logic, do not change core behavior
     def clean_data(examples):
         valid_mask = [label in CONFIG["labels"] for label in examples["label"]]
         return {
@@ -63,7 +68,7 @@ def load_and_process_data():
     val_ds = val_ds.map(clean_data, batched=True, remove_columns=val_ds.column_names)
     test_ds = test_ds.map(clean_data, batched=True, remove_columns=test_ds.column_names)
 
-    # 初始化Tokenizer（Qwen模型需手动设置pad_token）
+    # Initialize Tokenizer (Qwen model requires manual setting of pad_token)
     tokenizer = AutoTokenizer.from_pretrained(
         CONFIG["base_model_path"],
         trust_remote_code=True,
@@ -85,81 +90,100 @@ def load_and_process_data():
     tokenized_val = val_ds.map(tokenize_function, batched=True, remove_columns=["text"])
     tokenized_test = test_ds.map(tokenize_function, batched=True, remove_columns=["text"])
 
-    # HuggingFace Trainer 要求标签列名为 labels
+    # HuggingFace Trainer requires the label column to be named "labels"
     tokenized_train = tokenized_train.rename_column("label", "labels")
     tokenized_val = tokenized_val.rename_column("label", "labels")
     tokenized_test = tokenized_test.rename_column("label", "labels")
 
-    # 基本数据集规模打印（验证无异常）
+    # Basic info logging
     print(
-        f"数据预处理完成：训练集样本数={len(tokenized_train)}，验证集样本数={len(tokenized_val)}，测试集样本数={len(tokenized_test)}"
+        f"Data preprocessing completed: Training samples={len(tokenized_train)}, Validation samples={len(tokenized_val)}, Test samples={len(tokenized_test)}"
     )
     return tokenized_train, tokenized_val, tokenized_test, tokenizer
 
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
-    # 从logits中取概率最大的类别作为预测结果
+    # From logits, take the class with the highest probability as the prediction
     predictions = np.argmax(logits, axis=-1)
-    # 计算Macro-F1（对所有类别平等加权，适配类别分布不均衡场景）
+    # Calculate Macro-F1 (equally weighted across all classes, suitable for imbalanced class distributions)
     macro_f1 = f1_score(
         y_true=labels,
         y_pred=predictions,
         average="macro",
-        labels=list(label2id.values())  # 仅计算预设标签的F1，排除无效标签干扰
+        labels=list(label2id.values())  # Ensure all labels are considered in F1 calculation
     )
     return {"macro_f1": round(macro_f1, 4)}
 
 
 def main():
-    # 确保目标文件夹存在（避免路径错误）
+    # Ensure the target directory exists
     os.makedirs(CONFIG["lora_save_path"], exist_ok=True)
 
-    # 加载预处理后的数据
+    # Load preprocessed data
     tokenized_train, tokenized_val, tokenized_test, tokenizer = load_and_process_data()
 
-    # 基础模型（无LoRA）评估：获取 baseline F1分数
-    print("\n=== 基础模型（无LoRA）评估 ===")
-    # 加载基础模型（序列分类任务）
+    # Base Model (without LoRA) evaluation: obtain baseline F1 score
+    print("\n===== Base Model (without LoRA) Evaluation =====")
+    
+    # Load base model (sequence classification task)
     base_model = AutoModelForSequenceClassification.from_pretrained(
-        CONFIG["base_model_path"],
-        trust_remote_code=True,
-        num_labels=len(CONFIG["labels"]),  # 分类任务类别数=标签数
-        id2label=id2label,
-        label2id=label2id,
-        device_map="auto",  # 自动分配设备（优先GPU，无GPU则用CPU）
-        dtype=torch.float32  # 用FP32规避FP16梯度兼容问题
+        CONFIG["base_model_path"],          # 
+        trust_remote_code=True,             # Allow loading custom code from the model repository (Qwen requirement)
+        num_labels=len(CONFIG["labels"]),   # set the number of labels for the sequence classification head. Determines the classification head dimension
+        id2label=id2label,      # Bidirectional mapping between label names and IDs. Facilitates logging/evaluation with readable label names
+        label2id=label2id,      # Bidirectional mapping between label names and IDs. Facilitates logging/evaluation with readable label names
+        device_map="auto",      # Automatically allocate devices (prefer GPU, use CPU if no GPU)
+        dtype=torch.float32     # Use FP32 to avoid FP16 gradient compatibility issues
     )
-    # 初始化分类头权重（Qwen预训练模型无分类头，需手动初始化）
+    # Initialize classification head weights
+    # - Qwen models use "score" as the classification head name,
+    # - and the weights of the classification head were not initialized properly during pre-tarined model loading.
     if hasattr(base_model, "score"):
         torch.nn.init.normal_(base_model.score.weight, mean=0.0, std=0.02)
+    elif hasattr(base_model, "classifier"):
+        torch.nn.init.normal_(base_model.classifier.weight, mean=0.0, std=0.02)
 
-    # 基础模型评估配置（日志放入bank_lora_model/base_eval）
-    # 注意：这里使用验证集进行基线评估，而不是测试集，避免在训练前窥视测试集。
+    # Base Model Evaluation Configuration (logs saved in bank_lora_model/base_eval)
+    # Notes: Here we use the validation set for baseline evaluation instead of the test set to avoid peeking at the test set before training.
+    base_eval_dir = f"{CONFIG['lora_save_path']}/base_eval"
+    os.makedirs(base_eval_dir, exist_ok=True)
     base_trainer = Trainer(
         model=base_model,
         args=TrainingArguments(
-            output_dir=f"{CONFIG['lora_save_path']}/base_eval",
-            per_device_eval_batch_size=CONFIG["batch_size"],
-            do_train=False,
-            do_eval=True,
-            remove_unused_columns=False
+            output_dir=base_eval_dir,
+            per_device_eval_batch_size=CONFIG["eval_batch_size"],
+            do_train=False,                 # disable training
+            do_eval=True,                   # only evaluation
+            remove_unused_columns=False,    # keep all columns for evaluation
+            report_to="none"                # disable logging to external systems
         ),
-        eval_dataset=tokenized_val,  # 使用验证集
-        compute_metrics=compute_metrics
+        eval_dataset=tokenized_val,         # Use validation set for baseline evaluation
+        compute_metrics=compute_metrics     # Metric computation function
     )
-    # 执行评估并记录baseline F1
+    # Evaluate base model
     base_eval_result = base_trainer.evaluate()
+    # Log and save evaluation results
+    base_trainer.log_metrics("eval", base_eval_result)  # Log metrics to the Trainer's logger
+    base_trainer.save_metrics("eval", base_eval_result) # Save metrics to a JSON file
+    base_trainer.save_state()
+    # (Optional) If need save Base Model's prediction and hat{y}, Note: There is no original text in 'tokenized_val' anymore.）
+    base_pred = base_trainer.predict(tokenized_val)
+    np.savez(
+        os.path.join(base_eval_dir, "predictions.npz"),
+        predictions=base_pred.predictions,  # logits
+        label_ids=base_pred.label_ids
+    )
     base_val_f1 = base_eval_result["eval_macro_f1"]
-    print(f"基础模型（无LoRA）验证集 Macro-F1: {base_val_f1}")
+    print(f"Base Model (without LoRA) Valiation Macro-F1: {base_val_f1}")
 
-    # 释放基础模型显存（避免占用后续训练资源）
+    # Release base model GPU memory, avoid memory overflow during LoRA fine-tuning
     del base_model, base_trainer
     torch.cuda.empty_cache()
 
-    # LoRA微调训练
-    print("\n=== LoRA微调训练 ===")
-    # 重新加载基础模型（用于注入LoRA）
+    # LoRA Fine-Tuning
+    print("\n===== LoRA Fine-Tuning =====")
+    # Reload base model (for LoRA injection)
     lora_model = AutoModelForSequenceClassification.from_pretrained(
         CONFIG["base_model_path"],
         trust_remote_code=True,
@@ -169,50 +193,50 @@ def main():
         device_map="auto",
         dtype=torch.float32
     )
-    # 初始化分类头权重
+    # Initialize classification head weights
     if hasattr(lora_model, "score"):
         torch.nn.init.normal_(lora_model.score.weight, mean=0.0, std=0.02)
     elif hasattr(lora_model, "classifier"):
         torch.nn.init.normal_(lora_model.classifier.weight, mean=0.0, std=0.02)
 
-    # 自动探测分类头名称，确保参与训练并保存(让 分类头参加训练并保存)
+    # Autocheck classification head name, ensuring it can be trained and saved
     cls_head = "score" if hasattr(lora_model, "score") else ("classifier" if hasattr(lora_model, "classifier") else None)
     modules_to_save = [cls_head] if cls_head is not None else []
 
-    # 配置LoRA参数（基于Qwen-1.5B最优经验值）
+    # Config LoRA Args (based on Qwen-1.5B best experience)
     lora_config = LoraConfig(
-        r=8,  # LoRA秩：控制低秩矩阵维度，平衡效果与参数量
-        lora_alpha=16,  # 缩放因子：alpha = 2*r，增强梯度更新幅度
-        # target_modules=["q_proj", "v_proj"],  # 目标层：仅训练注意力Q/V投影层
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # 更充分的注意力层
-        lora_dropout=0.05,  # Dropout：降低过拟合风险
-        bias="none",  # 不训练偏置参数：减少计算量
-        task_type=TaskType.SEQ_CLS,  # 任务类型：序列分类（Sequence Classification）
-        modules_to_save=modules_to_save  # 让分类头参与训练并随适配器保存
+        r=8,                            # LoRA rank controls the capacity of the adaptation
+        lora_alpha=16,                  # scaling factor 'alpha' = 2*r to balance the gradient update scale
+        # target_modules=["q_proj", "v_proj"],  # target modules for LoRA injection (only q_proj and v_proj))
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # target modules for LoRA injection (all attention projections)
+        lora_dropout=0.05,              # Dropout rate for LoRA layers to mitigate overfitting
+        bias="none",                    # Do not add additional bias parameters, keep model size minimal
+        task_type=TaskType.SEQ_CLS,     # Task Type: Sequence Classification
+        modules_to_save=modules_to_save # Ensure classification head is trained and saved with the adapter
     )
     
-    # 注入LoRA到基础模型
+    # Inject LoRA into the base model
     lora_model = get_peft_model(lora_model, lora_config)
     
-    # 双保险：显式解冻分类头
+    # Double check: explicitly unfreeze classification head
     if cls_head is not None:
         for p in getattr(lora_model, cls_head).parameters():
-            p.requires_grad = True
+            p.requires_grad = True # ensure classification head is trainable
     
-    # 打印可训练参数占比（验证LoRA参数效率）
-    print("LoRA参数占比：")
+    # Print trainable parameters ratio (to verify LoRA parameter efficiency)
+    print("LoRA parameter ratio:")
     lora_model.print_trainable_parameters()
 
-    # 配置训练参数（日志放入bank_lora_model/lora_training）
+    # Config Traing Args （The logger will be saved in bank_lora_model/lora_training）
     training_args = TrainingArguments(
         output_dir=f"{CONFIG['lora_save_path']}/lora_training",
-        per_device_train_batch_size=CONFIG["batch_size"],
-        per_device_eval_batch_size=CONFIG["batch_size"],
-        num_train_epochs=CONFIG["epochs"],
+        per_device_train_batch_size=CONFIG["train_batch_size"],
+        per_device_eval_batch_size=CONFIG["eval_batch_size"],
+        num_train_epochs=CONFIG["epochs"],  # Number of training epochs
         learning_rate=CONFIG["lr"],
         logging_steps=50,
-        eval_strategy="epoch",  # 每个 epoch 后评估验证集
-        save_strategy="epoch",
+        eval_strategy="epoch",  # Evaluate at the end of each epoch
+        save_strategy="epoch",  # Save checkpoint at the end of each epoch
         save_total_limit=1,
         load_best_model_at_end=True,
         metric_for_best_model="macro_f1",  # 以 Macro-F1 选择最佳 checkpoint
@@ -220,45 +244,54 @@ def main():
         fp16=False,  # 可选：如显存紧张可改用 fp16 / bf16
         report_to="none",
         remove_unused_columns=False,
-        gradient_accumulation_steps=CONFIG["gradient_accumulation_steps"],  # 默认=1，不改变现有逻辑
+        gradient_accumulation_steps=CONFIG["gradient_accumulation_steps"],  # Gradient accumulation steps
         seed=CONFIG["seed"]
     )
 
-    # 初始化优化器（AdamW：适配LoRA微调的常用优化器）
+    # Initialize optimizer (AdamW: commonly used optimizer adapted for LoRA fine-tuning)
     optimizer = AdamW(
         lora_model.parameters(),
         lr=CONFIG["lr"],
-        weight_decay=0.01  # 权重衰减：降低过拟合风险
+        weight_decay=0.01  # Weight decay to reduce overfitting risk
     )
 
-    # 初始化Trainer
+    # Initialize Trainer
     trainer = Trainer(
         model=lora_model,
         args=training_args,
         train_dataset=tokenized_train,
-        eval_dataset=tokenized_val,  # 仅使用验证集进行周期性评估
+        eval_dataset=tokenized_val,  # Only use validation set for periodic evaluation
         compute_metrics=compute_metrics,
-        optimizers=(optimizer, None)
+        optimizers=(optimizer, None)    # Trainer(..., optimizers=(optimizer, lr_scheduler)): 自定义优化器，禁用学习率调度器 lr_scheduler = None
     )
 
-    # 执行LoRA微调
+    # Start LoRA fine-tuning
     train_result = trainer.train()
-    # 训练结束后（已自动加载 best checkpoint），在验证集上再评估一次
+    # Log and save training metrics
+    trainer.log_metrics("train", train_result.metrics)
+    trainer.save_metrics("train", train_result.metrics)
+    trainer.save_state()
+    # Evaluate LoRA fine-tuned model on validation set
+    print("\n===== LoRA Fine-Tuned Model Evaluation on Validation Set =====")
     lora_val_eval = trainer.evaluate()
     lora_val_f1 = lora_val_eval["eval_macro_f1"]
-    print(f"LoRA微调后（验证集）Macro-F1: {lora_val_f1}")
+    print(f"LoRA Fine-Tuned (Validation Set) Macro-F1: {lora_val_f1}")
 
-    # 保存LoRA权重（放入bank_lora_model根目录）
-    lora_model.save_pretrained(CONFIG["lora_save_path"])
-    print(f"\nLoRA权重已保存至：{CONFIG['lora_save_path']}")
+    # # Save LoRA Weights（in bank_lora_model root path）
+    # lora_model.save_pretrained(CONFIG["lora_save_path"])
+    # print(f"\nLoRA weights have been saved：{CONFIG['lora_save_path']}")
+    
+    # Using the best Trainer recorded best checkpoint path to avoid duplicate saving
+    best_ckpt_dir = trainer.state.best_model_checkpoint
+    print(f"Best LoRA checkpoint: {best_ckpt_dir}")
 
-    # 释放训练显存
+    # Release LoRA fine-tuning GPU memory
     del lora_model, trainer, optimizer
     torch.cuda.empty_cache()
 
-    # LoRA微调后模型评估
-    print("\n=== LoRA微调后模型评估 ===")
-    # 加载基础模型 + LoRA权重
+    # LoRA Fine-Tuned Model Final Evaluation in Test Set
+    print("\n===== LoRA Fine-Tuned Model Evaluation on Test Set =====")
+    # Load base model again
     final_model = AutoModelForSequenceClassification.from_pretrained(
         CONFIG["base_model_path"],
         trust_remote_code=True,
@@ -268,16 +301,17 @@ def main():
         device_map="auto",
         dtype=torch.float32
     )
-    # 合并LoRA权重到基础模型（模拟部署场景）
-    final_model = PeftModel.from_pretrained(final_model, CONFIG["lora_save_path"])
+    # Merge LoRA weights into base model (simulate deployment scenario)
+    final_model = PeftModel.from_pretrained(final_model, best_ckpt_dir)
+    # final_model = PeftModel.from_pretrained(final_model, CONFIG["lora_save_path"])
     final_model.merge_and_unload()
 
-    # 评估微调后模型（日志放入bank_lora_model/final_eval）
+    # Evaluate fine-tuned model (logs saved in bank_lora_model/final_eval)
     final_trainer = Trainer(
         model=final_model,
         args=TrainingArguments(
-            output_dir=f"{CONFIG['lora_save_path']}/final_eval",  # 统一路径
-            per_device_eval_batch_size=CONFIG["batch_size"],
+            output_dir=f"{CONFIG['lora_save_path']}/final_eval",
+            per_device_eval_batch_size=CONFIG["test_batch_size"],
             do_train=False,
             do_eval=True,
             remove_unused_columns=False
@@ -287,14 +321,14 @@ def main():
     )
     final_eval_result = final_trainer.evaluate()
     final_test_f1 = final_eval_result["eval_macro_f1"]
-    print(f"LoRA微调后模型测试集 Macro-F1: {final_test_f1}")
+    print(f"LoRA Fine-Tuned (Test Set) Macro-F1: {final_test_f1}")
 
-    # 输出微调前后效果对比
-    print("\n=== LoRA微调前后效果对比（验证 + 测试）===")
-    print(f"基础模型（验证集）Macro-F1: {base_val_f1}")
-    print(f"LoRA微调后（验证集）Macro-F1: {lora_val_f1}")
-    print(f"验证集提升幅度: {round(lora_val_f1 - base_val_f1, 4)}")
-    print(f"最终测试集 Macro-F1: {final_test_f1}  (未参与任何训练或调参阶段)" )
+    # Optional: Save final model predictions
+    print("\n=== Comparison of LoRA before and after Fine-Tuning (Valuation & Test)===")
+    print(f"Base Model (Validation) Macro-F1: {base_val_f1}")
+    print(f"LoRA Fine-Tuned (Validation) Macro-F1: {lora_val_f1}")
+    print(f"Validation Improvement: {round(lora_val_f1 - base_val_f1, 4)}")
+    print(f"Final Test Macro-F1: {final_test_f1}  (Not involved in any training or tuning phase)" )
 
 
 if __name__ == "__main__":
