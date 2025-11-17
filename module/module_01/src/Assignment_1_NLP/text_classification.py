@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Text classification for 10 company types using TF-IDF + Linear SVM.
+Text classification for 10 company types.
+
+Two alternative feature extraction & classifier paradigms are supported:
+
+1) TF-IDF + (LinearSVC | LogisticRegression)
+	- Word (jieba) tokenization or character n-grams.
+2) BERT embeddings (CLS pooled) + (LinearSVC | LogisticRegression)
+	- Uses HuggingFace transformers for contextual embeddings.
 
 Dataset: CSV with two columns
  - column[0]: integer label in [0..9]
  - column[1]: text description (likely Chinese)
 
-This script performs:
+Pipeline steps performed:
  - Robust CSV loading and basic cleaning
  - Stratified 80/20 train/hold-out split for a quick sanity check
- - K-fold cross-validation (stratified) for reliable validation
+ - K-fold stratified cross-validation for reliable validation
  - Accuracy metrics and optional model persistence
 
 Notes:
- - For Chinese text, default tokenization uses jieba (word-level). Optionally
-   character n-grams can be used, which sometimes perform better without a
-   tokenizer.
- - Accuracy must be >= 0.80 to meet acceptance criteria.
+ - Accuracy must be >= 0.80 (mean CV) to meet acceptance criteria.
+ - If --use-bert is specified, jieba / char n-gram options are ignored.
+ - BERT mode requires packages: transformers, torch.
 """
 
 from __future__ import annotations
@@ -25,7 +31,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Tuple
+import logging
+from dataclasses import dataclass
+from typing import Tuple, List, Optional
 
 import joblib
 import numpy as np
@@ -39,6 +47,92 @@ from sklearn.metrics import (
 from sklearn.model_selection import StratifiedKFold, train_test_split, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.svm import LinearSVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.base import BaseEstimator, TransformerMixin
+
+####################################################################################
+# BERT Embedding Transformer
+####################################################################################
+
+class BertEncoder(BaseEstimator, TransformerMixin):
+	"""Sklearn-compatible transformer that converts texts to BERT CLS embeddings.
+
+	Implementation notes:
+	- Loads model/tokenizer lazily on first transform to keep import overhead minimal.
+	- Uses CLS hidden state (can be swapped to mean pooling if desired).
+	- Batch processes input for reasonable speed.
+	- Returns a 2D numpy array (n_samples, hidden_size).
+	"""
+
+	def __init__(
+		self,
+		model_name: str = "bert-base-chinese",
+		max_length: int = 128,
+		batch_size: int = 16,
+		device: Optional[str] = None,
+		use_mean_pool: bool = False,
+		verbose: bool = False,
+	) -> None:
+		self.model_name = model_name
+		self.max_length = max_length
+		self.batch_size = batch_size
+		self.device = device
+		self.use_mean_pool = use_mean_pool
+		self.verbose = verbose
+		self._tokenizer = None
+		self._model = None
+
+	def _lazy_init(self):
+		if self._model is not None:
+			return
+		try:
+			from transformers import AutoTokenizer, AutoModel  # type: ignore
+			import torch  # type: ignore
+		except Exception as e:
+			raise ImportError(
+				"BERT mode requires 'transformers' and 'torch' packages. Install them via pip."
+			) from e
+		if self.device is None:
+			self.device = "cuda" if torch.cuda.is_available() else "cpu"
+		if self.verbose:
+			print(f"Initializing BERT model '{self.model_name}' on device={self.device}")
+		self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+		self._model = AutoModel.from_pretrained(self.model_name)
+		self._model.to(self.device)
+		self._model.eval()
+
+	def fit(self, X: List[str], y: Optional[List[int]] = None):  # noqa: D401
+		# No fitting needed; embeddings are from a frozen pretrained model.
+		return self
+
+	def transform(self, X: List[str]) -> np.ndarray:
+		self._lazy_init()
+		import torch  # type: ignore
+		embeddings: List[np.ndarray] = []
+		# Simple batching
+		for i in range(0, len(X), self.batch_size):
+			batch_texts = X[i : i + self.batch_size]
+			enc = self._tokenizer(
+				batch_texts,
+				padding=True,
+				truncation=True,
+				max_length=self.max_length,
+				return_tensors="pt",
+			)
+			enc = {k: v.to(self.device) for k, v in enc.items()}
+			with torch.no_grad():  # inference only
+				outputs = self._model(**enc)
+				last_hidden = outputs.last_hidden_state  # (batch, seq_len, hidden)
+				if self.use_mean_pool:
+					mask = enc["attention_mask"].unsqueeze(-1)  # (batch, seq_len, 1)
+					summed = (last_hidden * mask).sum(dim=1)
+					counts = mask.sum(dim=1).clamp(min=1)
+					pooled = summed / counts
+				else:
+					pooled = last_hidden[:, 0]  # CLS token
+			embeddings.append(pooled.cpu().numpy())
+		return np.vstack(embeddings)
+
 
 
 def _default_data_path() -> str:
@@ -50,7 +144,7 @@ def _default_data_path() -> str:
 		os.path.join(
 			os.path.dirname(__file__),
 			"../../../..",  # up to repo root
-			"core/data/module_01/NLP-text_classification/training.csv",
+			"core/datas/module_01/NLP-text_classification/training.csv",
 		)
 	)
 
@@ -117,13 +211,57 @@ def build_pipeline(
 	ngram_max: int = 2,
 	max_features: int | None = 30000,
 	C: float = 1.0,
+	classifier: str = "svm",
+	use_bert: bool = False,
+	bert_model_name: str = "bert-base-chinese",
+	bert_max_length: int = 128,
+	bert_batch_size: int = 16,
+	bert_mean_pool: bool = False,
+	bert_verbose: bool = False,
 ) -> Pipeline:
 	"""Create a scikit-learn text classification pipeline.
 
-	- If use_char_ngrams is True, character n-grams are used.
-	- Otherwise, jieba tokenizer is used at word level.
-	- Classifier: Linear Support Vector Machine (LinearSVC).
+	Modes:
+	  - TF-IDF (word via jieba or character n-gram) + chosen classifier
+	  - BERT embeddings (CLS or mean pooled) + chosen classifier
+
+	Args:
+		use_char_ngrams: If True and not using BERT, use char n-gram TF-IDF.
+		ngram_min/ngram_max: n-gram range for TF-IDF (ignored in BERT mode).
+		max_features: Cap vocabulary size for TF-IDF.
+		C: Regularization strength for LinearSVC (if classifier='svm').
+		classifier: 'svm' or 'logreg'.
+		use_bert: If True, use BERT embeddings instead of TF-IDF.
+		bert_model_name: Pretrained model name.
+		bert_max_length: Max sequence length for tokenization.
+		bert_batch_size: Batch size during embedding extraction.
+		bert_mean_pool: Use mean pooling over tokens instead of CLS.
+		bert_verbose: Print initialization info.
 	"""
+
+	clf: BaseEstimator
+	if classifier == "svm":
+		clf = LinearSVC(C=C)
+	elif classifier == "logreg":
+		# For high dimensional TF-IDF or dense BERT embeddings
+		clf = LogisticRegression(max_iter=1000, n_jobs=None)
+	else:
+		raise ValueError("classifier must be one of {'svm','logreg'}")
+
+	if use_bert:
+		embed = BertEncoder(
+			model_name=bert_model_name,
+			max_length=bert_max_length,
+			batch_size=bert_batch_size,
+			use_mean_pool=bert_mean_pool,
+			verbose=bert_verbose,
+		)
+		return Pipeline([
+			("embed", embed),
+			("clf", clf),
+		])
+
+	# TF-IDF path
 	if use_char_ngrams:
 		vectorizer = TfidfVectorizer(
 			analyzer="char",
@@ -131,31 +269,31 @@ def build_pipeline(
 			max_features=max_features,
 		)
 	else:
-		# Lazy import to avoid requiring jieba when using char-ngrams
 		try:
-			import jieba
+			import jieba  # type: ignore
+			try:
+				jieba.setLogLevel(logging.ERROR)
+			except Exception:
+				pass
 		except Exception as e:
 			raise ImportError(
-				"jieba is required for word-level tokenization. Install or use --use-char-ngrams."
+				"jieba is required for word-level tokenization. Install or use --use-char-ngrams or --use-bert."
 			) from e
 
 		def jieba_tokenize(text: str):
-			# Accurate mode segmentation
 			return list(jieba.lcut(text))
 
 		vectorizer = TfidfVectorizer(
-			tokenizer=jieba_tokenize,  # custom tokenizer for Chinese
-			token_pattern=None,  # must be None when using a custom tokenizer
+			tokenizer=jieba_tokenize,
+			token_pattern=None,
 			ngram_range=(ngram_min, ngram_max),
 			max_features=max_features,
 		)
 
-	clf = LinearSVC(C=C)
-	pipe = Pipeline([
+	return Pipeline([
 		("tfidf", vectorizer),
 		("clf", clf),
 	])
-	return pipe
 
 
 def evaluate_with_holdout(
@@ -166,7 +304,7 @@ def evaluate_with_holdout(
 		X,
 		y,
 		test_size=test_size,
-		stratify=y,
+		stratify=y, # using stratified split by label to maintain balanced classes distribution
 		random_state=random_state,
 	)
 	pipe.fit(X_train, y_train)
@@ -192,21 +330,29 @@ def ensure_dir(path: str) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+	"""Parse command-line arguments and return namespace."""
 	parser = argparse.ArgumentParser(description="Train and validate a 10-class text classifier")
+	# Data & split
 	parser.add_argument("--data-path", type=str, default=_default_data_path(), help="Path to training CSV")
 	parser.add_argument("--test-size", type=float, default=0.2, help="Hold-out test size fraction (default: 0.2)")
 	parser.add_argument("--cv", type=int, default=5, help="Number of CV folds (default: 5)")
 	parser.add_argument("--random-state", type=int, default=42, help="Random seed for splitting and CV")
-	parser.add_argument("--use-char-ngrams", action="store_true", help="Use character n-grams instead of jieba")
+	# Feature extraction (TF-IDF)
+	parser.add_argument("--use-char-ngrams", action="store_true", help="Use character n-grams instead of jieba (TF-IDF mode)")
 	parser.add_argument("--ngram-min", type=int, default=1, help="Min n in n-gram range (default: 1)")
 	parser.add_argument("--ngram-max", type=int, default=2, help="Max n in n-gram range (default: 2)")
 	parser.add_argument("--max-features", type=int, default=30000, help="Max features for TF-IDF (default: 30000)")
-	parser.add_argument("--C", type=float, default=1.0, help="LinearSVC regularization parameter C (default: 1.0)")
-	parser.add_argument(
-		"--save-model",
-		action="store_true",
-		help="Persist trained pipeline (vectorizer + classifier) after hold-out training",
-	)
+	# BERT feature extraction
+	parser.add_argument("--use-bert", action="store_true", help="Use BERT embeddings instead of TF-IDF")
+	parser.add_argument("--bert-model-name", type=str, default="bert-base-chinese", help="HuggingFace model name (default: bert-base-chinese)")
+	parser.add_argument("--bert-max-length", type=int, default=128, help="Max sequence length for BERT (default: 128)")
+	parser.add_argument("--bert-batch-size", type=int, default=16, help="Batch size for BERT embedding extraction (default: 16)")
+	parser.add_argument("--bert-mean-pool", action="store_true", help="Use mean pooling (default CLS token)")
+	# Classifier selection
+	parser.add_argument("--classifier", type=str, choices=["svm", "logreg"], default="svm", help="Classifier type: svm | logreg (default: svm)")
+	parser.add_argument("--C", type=float, default=1.0, help="LinearSVC regularization parameter C (ignored if logreg)")
+	# Persistence
+	parser.add_argument("--save-model", action="store_true", help="Persist trained pipeline after training")
 	parser.add_argument(
 		"--output-dir",
 		type=str,
@@ -228,25 +374,36 @@ def main() -> None:
 	X, y = load_dataset(args.data_path)
 	print(f"Loaded {len(X)} samples across {len(set(y))} unique labels.")
 
-	# Build pipeline
+	# Build pipeline (feature extractor + classifier)
 	pipe = build_pipeline(
 		use_char_ngrams=args.use_char_ngrams,
 		ngram_min=args.ngram_min,
 		ngram_max=args.ngram_max,
 		max_features=args.max_features,
 		C=args.C,
+		classifier=args.classifier,
+		use_bert=args.use_bert,
+		bert_model_name=args.bert_model_name,
+		bert_max_length=args.bert_max_length,
+		bert_batch_size=args.bert_batch_size,
+		bert_mean_pool=args.bert_mean_pool,
 	)
+
+	mode_desc = (
+		"BERT embeddings" if args.use_bert else ("Char n-gram TF-IDF" if args.use_char_ngrams else "Jieba word TF-IDF")
+	)
+	print(f"Feature mode: {mode_desc}; Classifier: {args.classifier}")
 
 	# Hold-out evaluation (80/20 by default)
 	print("\n=== Hold-out evaluation (train/validation split) ===")
 	acc_holdout, report, cm = evaluate_with_holdout(
 		pipe, X, y, test_size=args.test_size, random_state=args.random_state
 	)
-	print(f"Hold-out accuracy: {acc_holdout:.4f}")
-	print("Classification report (hold-out):\n", report)
-	print("Confusion matrix (hold-out):\n", cm)
+	print(f"Hold-out accuracy: {acc_holdout:.4f}") # Accuracy = correct samples / total samples
+	print("Classification report (hold-out):\n", report) # Precision, Recall, F1-score per class
+	print("Confusion matrix (hold-out):\n", cm) # Rows: true labels, Columns: predicted labels
 
-	# Cross-validation evaluation
+	# Cross-validation evaluation   
 	print("\n=== Cross-validation evaluation ===")
 	pipe_cv = build_pipeline(
 		use_char_ngrams=args.use_char_ngrams,
@@ -254,6 +411,12 @@ def main() -> None:
 		ngram_max=args.ngram_max,
 		max_features=args.max_features,
 		C=args.C,
+		classifier=args.classifier,
+		use_bert=args.use_bert,
+		bert_model_name=args.bert_model_name,
+		bert_max_length=args.bert_max_length,
+		bert_batch_size=args.bert_batch_size,
+		bert_mean_pool=args.bert_mean_pool,
 	)
 	mean_acc, std_acc, scores = evaluate_with_cv(
 		pipe_cv, X, y, cv=args.cv, random_state=args.random_state
@@ -276,8 +439,19 @@ def main() -> None:
 			ngram_max=args.ngram_max,
 			max_features=args.max_features,
 			C=args.C,
+			classifier=args.classifier,
+			use_bert=args.use_bert,
+			bert_model_name=args.bert_model_name,
+			bert_max_length=args.bert_max_length,
+			bert_batch_size=args.bert_batch_size,
+			bert_mean_pool=args.bert_mean_pool,
 		)
 		pipe_final.fit(X, y)
+		# Adjust filename suffix based on mode
+		mode_tag = "bert" if args.use_bert else ("char_tfidf" if args.use_char_ngrams else "jieba_tfidf")
+		clf_tag = args.classifier
+		base_name = f"text_classifier_{mode_tag}_{clf_tag}.joblib"
+		model_path = os.path.join(args.output_dir, base_name)
 		joblib.dump(pipe_final, model_path)
 		print(f"Model saved to: {model_path}")
 
