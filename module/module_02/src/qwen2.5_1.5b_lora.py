@@ -10,26 +10,11 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trai
 from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 from torch.optim import AdamW
 
-# Core parameter configuration (modify paths and hyperparameters according to the actual environment)
-from config_lora import get_config
-# CONFIG = get_config()
-CONFIG = {
-    "base_model_path": "/home/wyj/workspace/multimodal-llm-workshop/core/models/Qwen2.5-1.5B-Instruct",  # Base model path or model ID
-    "train_data_path": "/home/wyj/workspace/multimodal-llm-workshop/core/datas/module_02/bank_intent_data/train.jsonl",  # Training set path
-    "val_data_path": "/home/wyj/workspace/multimodal-llm-workshop/core/datas/module_02/bank_intent_data/val.jsonl",      # Validation set path（仅用于调参与早停，不参与最终报告）
-    "test_data_path": "/home/wyj/workspace/multimodal-llm-workshop/core/datas/module_02/bank_intent_data/test.jsonl",    # Test set path（仅最终评估使用，训练过程中绝不触碰，避免数据泄露）
-    "lora_save_path": "/home/wyj/workspace/multimodal-llm-workshop/module/module_02/outputs/bank_lora_model",                # LoRA weights save path (all files stored together)
-    "labels": ["fraud_risk", "refund", "balance", "card_lost", "other"],  # Intent label list
-    "max_seq_len": 64,      # Maximum text truncation length (adapted to corpus length distribution)
-    "train_batch_size": 8,  # Training batch size (based on GPU memory capacity)
-    "eval_batch_size": 8,    # Validation batch size (can be larger to speed up evaluation)
-    "test_batch_size": 8,   # Test batch size (can be larger to speed up evaluation)
-    "batch_size": 8,        # Unified batch size for training and evaluation (for simplicity)
-    "epochs": 1,            # Number of training epochs (balance fitting effsect and overfitting risk)
-    "gradient_accumulation_steps": 1,  # Gradient accumulation steps (default=1, no change to existing logic)
-    "lr": 2e-5,             # LoRA learning rate (based on Qwen-1.5B optimal empirical value)
-    "seed": 42              # Random seed for reproducibility
-}
+# Import unified configuration (dynamic path detection & overrides)
+from qwen_lora_config import get_config, CONFIG_DESCRIPTIONS
+
+# Load configuration (supports environment variable overrides or direct kwargs)
+CONFIG = get_config()
 
 # Config GPU Devices (Single GPU Environment, Multi-GPU can adjust accordingly, e.g. ["0,1"])
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -117,8 +102,12 @@ def compute_metrics(eval_pred):
 
 
 def main():
-    # Ensure the target directory exists
+    # Ensure output directory exists (already created in get_config, but safe)
     os.makedirs(CONFIG["lora_save_path"], exist_ok=True)
+
+    print("Loaded CONFIG parameters (key: value) ->")
+    for k, v in CONFIG.items():
+        print(f"  {k}: {v}")
 
     # Load preprocessed data
     tokenized_train, tokenized_val, tokenized_test, tokenizer = load_and_process_data()
@@ -136,6 +125,14 @@ def main():
         device_map="auto",      # Automatically allocate devices (prefer GPU, use CPU if no GPU)
         dtype=torch.float32     # Use FP32 to avoid FP16 gradient compatibility issues
     )
+    # Ensure model knows the pad token id (required for batch size > 1)
+    # - If not, Error: "Cannot handle batch sizes > 1 if no padding token is defined." From Transformers will be raised
+    try:
+        base_model.config.pad_token_id = tokenizer.pad_token_id
+        if hasattr(base_model, "generation_config") and base_model.generation_config is not None:
+            base_model.generation_config.pad_token_id = tokenizer.pad_token_id
+    except Exception:
+        pass
     # Initialize classification head weights
     # - Qwen models use "score" as the classification head name,
     # - and the weights of the classification head were not initialized properly during pre-tarined model loading.
@@ -193,6 +190,13 @@ def main():
         device_map="auto",
         dtype=torch.float32
     )
+    # Ensure model knows the pad token id
+    try:
+        lora_model.config.pad_token_id = tokenizer.pad_token_id
+        if hasattr(lora_model, "generation_config") and lora_model.generation_config is not None:
+            lora_model.generation_config.pad_token_id = tokenizer.pad_token_id
+    except Exception:
+        pass
     # Initialize classification head weights
     if hasattr(lora_model, "score"):
         torch.nn.init.normal_(lora_model.score.weight, mean=0.0, std=0.02)
@@ -301,6 +305,13 @@ def main():
         device_map="auto",
         dtype=torch.float32
     )
+    # Ensure model knows the pad token id
+    try:
+        final_model.config.pad_token_id = tokenizer.pad_token_id
+        if hasattr(final_model, "generation_config") and final_model.generation_config is not None:
+            final_model.generation_config.pad_token_id = tokenizer.pad_token_id
+    except Exception:
+        pass
     # Merge LoRA weights into base model (simulate deployment scenario)
     final_model = PeftModel.from_pretrained(final_model, best_ckpt_dir)
     # final_model = PeftModel.from_pretrained(final_model, CONFIG["lora_save_path"])
