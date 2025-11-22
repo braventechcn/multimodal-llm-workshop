@@ -20,8 +20,6 @@ Usage Example:
             --data-dir /path/to/cifar-10-batches-py \
             --out-dir ./cifar10_images \
             --limit-per-class 500
-    
-    ./module/module_01/cifar10/CIFAR10_data_transfor.py
 
 If `--limit-per-class` is omitted, all images are exported.
 
