@@ -379,7 +379,10 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--max-features", type=int, default=30000, help="Max features for TF-IDF (default: 30000)")
 	# BERT feature extraction
 	parser.add_argument("--use-bert", action="store_true", help="Use BERT embeddings instead of TF-IDF")
-	parser.add_argument("--bert-model-name", type=str, default="bert-base-chinese", help="HuggingFace model name (default: bert-base-chinese)")
+	parser.add_argument("--bert-model-name", 
+                     	type=str, default="bert-base-chinese", 
+                     	help="HuggingFace model name (default: bert-base-chinese, \
+                          	refer to https://huggingface.co/google-bert/bert-base-chinese)")
 	parser.add_argument("--bert-max-length", type=int, default=128, help="Max sequence length for BERT (default: 128)")
 	parser.add_argument("--bert-batch-size", type=int, default=16, help="Batch size for BERT embedding extraction (default: 16)")
 	parser.add_argument("--bert-mean-pool", action="store_true", help="Use mean pooling (default CLS token)")
