@@ -1,19 +1,20 @@
 # encoding=utf-8
 #!/usr/bin/env python3
-"""
-本脚本演示如何在中文文本上计算与验证 TF-IDF。
+"""中文文本 TF-IDF 计算与验证示例。
 
-实现要点：
-1) 使用 jieba 进行中文分词，得到 token 序列；
-2) 用 CountVectorizer 得到原始 TF（词频）；
-3) 用 TfidfVectorizer 拟合得到 IDF，并设置 norm=None 以获得“未归一化”的 tf*idf；
-4) 手动将 TF 与 IDF 相乘，验证与 sklearn 未归一化结果一致；
-5) 对手动结果做 L2 归一化，验证与 sklearn 默认设置（norm='l2'）一致；
-6) 打印首篇文档的 Top-K 关键词，展示 TF、IDF、TF-IDF 以及 L2 归一化后的值。
+步骤总览（保持教学、不过度封装，便于逐行理解）：
+1. 分词：使用 jieba 获取中文 token 列表。
+2. 原始 TF：用 CountVectorizer 按与 TF-IDF 相同的词表统计词频矩阵。
+3. 未归一化 TF-IDF（tf * idf）：TfidfVectorizer(norm=None) 拟合得到 IDF 与 tf*idf 数值。
+4. 手动验证：使用 TF 矩阵 * 对角 IDF 验证与 sklearn 未归一化输出一致。
+5. 归一化验证：手动对 tf*idf 做 L2 归一化，与 sklearn 默认 norm='l2' 结果比对。
+6. 关键词展示：针对首篇文档按未归一化 tf*idf 排序取 Top-K，打印多列对照。
 
-关键公式（与 sklearn 一致，smooth_idf=True）：
+关键公式（smooth_idf=True 与 sklearn 一致）：
     idf(t) = log((1 + n_docs) / (1 + df(t))) + 1
-其中 df(t) 为包含词项 t 的文档数。
+其中 df(t) 是包含词项 t 的文档数。平滑项避免 df=0 或极端值。
+
+设计目标：示例明确、数值可验证、输出结构清晰；不对核心逻辑做多层封装，便于学习。
 """
 
 import jieba
@@ -23,7 +24,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.preprocessing import normalize
 from scipy.sparse import diags
 
-# 示例文档（可改为多文档列表）
+# =============================
+# 示例文档（可改为更大/外部语料）
+# =============================
 docs = [
     # 尝试覆盖“屏幕/电池/主板/进水/维修/数据恢复/评估回收”等主题词，
     # 以获得更稳健的文档频率 df，从而使 IDF 更有区分度。
@@ -42,22 +45,23 @@ docs = [
 top_k = 5
 
 def tok(s: str) -> List[str]:
-    """将中文句子切分为词 tokens。
+    """中文分词函数。
 
-    说明：
-    - 使用 jieba.lcut 进行中文分词；
-    - 过滤掉长度为 1 的 token（如标点或单字）和纯空白；
-    - 返回用于向量化器（Vectorizer）的 token 列表。
+    策略：
+    - 使用 jieba.lcut 做精确模式分词；
+    - 过滤长度为 1 的 token（多为单字或符号，对 TF-IDF 贡献低）；
+    - 去除纯空白；
+    返回：用于后续 Count/TfidfVectorizer 的 token 列表。
     """
     return [w for w in jieba.lcut(s) if len(w) > 1 and w.strip()]
 
 def topk_indices(arr: np.ndarray, k: int) -> np.ndarray:
-    """返回一维数组 arr 中数值最大的前 k 个索引（降序）。
+    """获取一维数组中 Top-K 最大值的索引（降序）。
 
-    实现细节：
-    - 使用 np.argpartition 获取无序的 Top-K 索引，时间复杂度优于完整排序；
-    - 再对 Top-K 片段做二次排序，得到降序排列的真实 Top-K 索引；
-    - 若 k 超过非零元素个数或数组长度，自动截断。
+    算法说明：
+    - np.argpartition 仅定位 Top-K 位置，复杂度优于完整排序；
+    - 对 Top-K 片段再次按值排序得到最终降序索引；
+    - 自动处理 k 超界或有效元素不足的情况。
     """
     k = min(k, (arr != 0).sum() if arr.ndim == 1 else arr.shape[-1])
     if k <= 0:
@@ -114,8 +118,11 @@ def main():
         X_tfidf_sklearn_l2.toarray(), X_tfidf_manual_l2.toarray(), atol=1e-6
     )
 
-    print(f"验证(tf*idf 与 sklearn 未归一化) = {verify_raw}")
-    print(f"验证(L2 归一化与 sklearn 默认)   = {verify_l2}")
+    # ========== 验证输出 ==========
+    print("\n[验证结果]")
+    print(f"未归一化 tf*idf 与 sklearn 对比一致: {verify_raw}")
+    print(f"L2 归一化与 sklearn 默认结果一致 : {verify_l2}")
+    print(f"文档数: {X_tf.shape[0]} | 词项数: {X_tf.shape[1]}")
 
     # 5) 展示首篇文档的 Top-K 关键词（基于未归一化 TF-IDF 排序）
     doc_id = 0
@@ -125,12 +132,13 @@ def main():
 
     idx = topk_indices(tfidf_row, top_k)
 
-    print("\nTop-{} 关键词:".format(len(idx)))
-    print("词项\tTF(词频)\tIDF\tTF-IDF\tTF-IDF(L2)")
+    print(f"\n[Top-{len(idx)} 关键词 - 文档0 基于未归一化 TF-IDF]")
+    header = f"{'词项':<12}{'TF':>4}{'IDF':>10}{'TF-IDF':>12}{'TF-IDF(L2)':>14}"
+    print(header)
+    print('-' * len(header))
     for i in idx:
-        print(
-            f"{vocab[i]}\t{int(tf_row[i])}\t\t{idf[i]:.3f}\t{tfidf_row[i]:.3f}\t{tfidf_row_l2[i]:.3f}"
-        )
+        print(f"{vocab[i]:<12}{int(tf_row[i]):>4}{idf[i]:>10.3f}{tfidf_row[i]:>12.3f}{tfidf_row_l2[i]:>14.3f}")
+    print('\n说明: TF-IDF(L2) 为向量整体 L2 归一化后的数值，便于余弦/距离度量。')
 
 if __name__ == "__main__":
     main()

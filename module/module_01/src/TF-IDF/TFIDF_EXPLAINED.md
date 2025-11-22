@@ -2,8 +2,8 @@
 
 本说明配合 `tfidf.py` 使用，帮助你理解实现细节、验证方法以及如何按需扩展。
 
-- 代码位置：`module/module_01/src/tfidf.py`
-- 文档位置：`module/module_01/src/TFIDF_EXPLAINED.md`
+- 代码位置：`module/module_01/src/TF-IDF/tfidf.py`
+- 文档位置：`module/module_01/src/TF-IDF/TFIDF_EXPLAINED.md`
 
 ## 核心目标
 
@@ -58,7 +58,7 @@
 pip install -r requirements.txt
 
 # 运行脚本
-python3 module/module_01/src/tfidf.py
+python3 module/module_01/src/TF-IDF/tfidf.py
 ```
 
 正常输出示例（示意）：
