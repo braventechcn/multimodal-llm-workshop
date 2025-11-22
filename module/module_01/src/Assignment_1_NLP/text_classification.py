@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Text classification for 10 company types.
-
-Two alternative feature extraction & classifier paradigms are supported:
-
-1) TF-IDF + (LinearSVC | LogisticRegression)
-	- Word (jieba) tokenization or character n-grams.
-2) BERT embeddings (CLS pooled) + (LinearSVC | LogisticRegression)
-	- Uses HuggingFace transformers for contextual embeddings.
-
-Dataset: CSV with two columns
- - column[0]: integer label in [0..9]
- - column[1]: text description (likely Chinese)
-
-Pipeline steps performed:
- - Robust CSV loading and basic cleaning
- - Stratified 80/20 train/hold-out split for a quick sanity check
- - K-fold stratified cross-validation for reliable validation
- - Accuracy metrics and optional model persistence
-
-Notes:
- - Accuracy must be >= 0.80 (mean CV) to meet acceptance criteria.
- - If --use-bert is specified, jieba / char n-gram options are ignored.
- - BERT mode requires packages: transformers, torch.
-"""
 
 from __future__ import annotations
 
@@ -36,6 +11,7 @@ from dataclasses import dataclass
 from typing import Tuple, List, Optional
 
 import joblib
+import json
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -106,12 +82,37 @@ class BertEncoder(BaseEstimator, TransformerMixin):
 		return self
 
 	def transform(self, X: List[str]) -> np.ndarray:
+		"""
+		Convert raw texts to embedding matrix.
+
+		Accepts list/tuple/numpy array of texts. Ensures each element is str before
+		calling the tokenizer. This avoids transformers complaining about numpy array
+		input types.
+		"""
+		# 1) 惰性初始化：仅在第一次调用时加载 tokenizer 和 model，避免未使用时的启动开销
 		self._lazy_init()
 		import torch  # type: ignore
+
+		# Normalize input to a python list of strings
+		# 2) 兼容三种常见集合类型：np.ndarray / list / tuple，统一转为 list
+		if isinstance(X, np.ndarray):
+			X_list = X.tolist()
+		elif isinstance(X, (list, tuple)):
+			X_list = list(X)
+		else:
+			raise TypeError("BertEncoder.transform expects a list/tuple/numpy.ndarray of texts")
+
+		# Coerce all items to str (robustness) and strip
+		# 3) 将所有元素安全转换为字符串并去除首尾空白；过滤 None 和空字符串，保证后续 tokenizer 输入有效
+		X_list = [str(t).strip() for t in X_list if t is not None and str(t).strip() != ""]
+		if len(X_list) == 0:
+			# 返回形状 (0, hidden_size) 的空矩阵，遵守 sklearn transformer 输出约定
+			return np.empty((0, self._model.config.hidden_size), dtype=np.float32)  # type: ignore
+
 		embeddings: List[np.ndarray] = []
-		# Simple batching
-		for i in range(0, len(X), self.batch_size):
-			batch_texts = X[i : i + self.batch_size]
+		# 4) 小批次遍历：降低显存峰值，提高吞吐；batch_size 可在初始化时调整
+		for i in range(0, len(X_list), self.batch_size):
+			batch_texts = X_list[i : i + self.batch_size]
 			enc = self._tokenizer(
 				batch_texts,
 				padding=True,
@@ -119,25 +120,32 @@ class BertEncoder(BaseEstimator, TransformerMixin):
 				max_length=self.max_length,
 				return_tensors="pt",
 			)
+			# 5) 将所有输入张量迁移到目标设备（CPU/GPU）；避免跨设备计算报错
 			enc = {k: v.to(self.device) for k, v in enc.items()}
-			with torch.no_grad():  # inference only
+			with torch.no_grad():
+				# 6) 关闭梯度，减少显存与计算开销；仅做前向推理
 				outputs = self._model(**enc)
-				last_hidden = outputs.last_hidden_state  # (batch, seq_len, hidden)
+				last_hidden = outputs.last_hidden_state
 				if self.use_mean_pool:
-					mask = enc["attention_mask"].unsqueeze(-1)  # (batch, seq_len, 1)
+					# 7) 均值池化：利用 attention_mask 过滤 padding，再按有效 token 求平均
+					mask = enc["attention_mask"].unsqueeze(-1)
 					summed = (last_hidden * mask).sum(dim=1)
 					counts = mask.sum(dim=1).clamp(min=1)
 					pooled = summed / counts
 				else:
-					pooled = last_hidden[:, 0]  # CLS token
-			embeddings.append(pooled.cpu().numpy())
+					# 8) CLS 池化：直接取序列第一个位置向量，常用于句级表示
+					pooled = last_hidden[:, 0]
+			# 9) 转回 CPU，转 numpy 并统一为 float32 减少内存占用
+			embeddings.append(pooled.cpu().numpy().astype(np.float32))
+
+		# 10) vstack 合并所有 batch 的向量，得到 (n_samples, hidden_size) 输出供下游分类器使用
 		return np.vstack(embeddings)
 
 
 
 def _default_data_path() -> str:
-	"""Return the default dataset path within this repository.
-
+	"""
+	Return the default dataset path within this repository.
 	Uses a relative path from the project root. Adjust if project structure changes.
 	"""
 	return os.path.abspath(
@@ -149,32 +157,45 @@ def _default_data_path() -> str:
 	)
 
 
-def load_dataset(csv_path: str) -> Tuple[np.ndarray, np.ndarray]:
-	"""Load the dataset from CSV and return (X_text, y_label).
+def load_dataset(path: str) -> Tuple[np.ndarray, np.ndarray]:
+	"""	
+	Load dataset from a CSV or JSONL file and return (X_text, y_label).
 
-	This function is tolerant of a header row; it will try to coerce the first
-	column to integers and treat the second column as text.
+	Auto-detects format by file extension:
+	  - .csv  : expects two columns (label, text) header optional.
+	  - .jsonl: each line is a JSON object with keys 'label' and 'text'.
 	"""
-	if not os.path.exists(csv_path):
-		raise FileNotFoundError(f"CSV not found: {csv_path}")
+	if not os.path.exists(path):
+		raise FileNotFoundError(f"Dataset file not found: {path}")
 
-	# Try reading without header first for maximum compatibility
-	try:
-		df = pd.read_csv(csv_path, header=None, names=["label", "text"], encoding="utf-8")
-	except Exception:
-		# Fallback: let pandas infer header
-		df = pd.read_csv(csv_path, encoding="utf-8")
-		# Try to locate appropriate columns
-		if df.shape[1] < 2:
-			raise ValueError("Expected at least 2 columns in the CSV (label, text)")
-		df = df.iloc[:, :2]
-		df.columns = ["label", "text"]
+	ext = os.path.splitext(path)[1].lower() # get file extension
 
-	# Basic sanitation
-	if "label" not in df or "text" not in df:
-		raise ValueError("CSV must contain 'label' and 'text' columns (first two columns)")
+	if ext == ".jsonl":
+		data = []
+		with open(path, "r", encoding="utf-8") as f:
+			for line in f:
+				line = line.strip()
+				if not line:
+					continue
+				try:
+					data.append(json.loads(line))
+				except json.JSONDecodeError as e:
+					raise ValueError(f"Invalid JSONL line: {e}") from e
+		df = pd.DataFrame(data)
+		if "label" not in df or "text" not in df:
+			raise ValueError("JSONL must contain 'label' and 'text' fields")
+	else:  # treat as CSV by default
+		try:
+			df = pd.read_csv(path, header=None, names=["label", "text"], encoding="utf-8")
+		except Exception:
+			df = pd.read_csv(path, encoding="utf-8")
+			if df.shape[1] < 2:
+				raise ValueError("Expected at least 2 columns in the CSV (label, text)")
+			df = df.iloc[:, :2]
+			df.columns = ["label", "text"]
+		if "label" not in df or "text" not in df:
+			raise ValueError("CSV must contain 'label' and 'text' columns (first two columns)")
 
-	# Coerce labels to integers, drop rows that cannot be coerced
 	def _safe_int(x):
 		try:
 			return int(x)
@@ -185,22 +206,10 @@ def load_dataset(csv_path: str) -> Tuple[np.ndarray, np.ndarray]:
 	df = df.dropna(subset=["label", "text"]).copy()
 	df["label"] = df["label"].astype(int)
 	df["text"] = df["text"].astype(str).str.strip()
-
-	# Filter out any empty texts
 	df = df[df["text"].str.len() > 0]
 
 	X = df["text"].to_numpy()
 	y = df["label"].to_numpy()
-
-	# Optional: sanity check for label range
-	unique_labels = sorted(pd.unique(y))
-	if not all(isinstance(v, (int, np.integer)) for v in unique_labels):
-		raise ValueError("Labels must be integers (0..9)")
-	if len(unique_labels) > 10:
-		print(
-			f"Warning: found {len(unique_labels)} unique labels, expected 10 (0..9)",
-			file=sys.stderr,
-		)
 
 	return X, y
 
@@ -210,20 +219,23 @@ def build_pipeline(
 	ngram_min: int = 1,
 	ngram_max: int = 2,
 	max_features: int | None = 30000,
-	C: float = 1.0,
-	classifier: str = "svm",
 	use_bert: bool = False,
 	bert_model_name: str = "bert-base-chinese",
 	bert_max_length: int = 128,
 	bert_batch_size: int = 16,
 	bert_mean_pool: bool = False,
 	bert_verbose: bool = False,
+	classifier: str = "svm",
+	C: float = 1.0,  # SVM C
+	logreg_C: float = 1.0,
+	logreg_max_iter: int = 1000,
+	logreg_solver: str = "lbfgs",
 ) -> Pipeline:
 	"""Create a scikit-learn text classification pipeline.
 
 	Modes:
-	  - TF-IDF (word via jieba or character n-gram) + chosen classifier
-	  - BERT embeddings (CLS or mean pooled) + chosen classifier
+	  - TF-IDF (word via jieba or character n-gram) + classifier
+	  - BERT embeddings (CLS or mean pooled) + classifier
 
 	Args:
 		use_char_ngrams: If True and not using BERT, use char n-gram TF-IDF.
@@ -243,8 +255,13 @@ def build_pipeline(
 	if classifier == "svm":
 		clf = LinearSVC(C=C)
 	elif classifier == "logreg":
-		# For high dimensional TF-IDF or dense BERT embeddings
-		clf = LogisticRegression(max_iter=1000, n_jobs=None)
+		# LogisticRegression for multi-class; expose key hyperparameters.
+		clf = LogisticRegression(
+			C=logreg_C,
+			max_iter=logreg_max_iter,
+			solver=logreg_solver,
+			multinomial="auto", #  'multi_class' was deprecated in version 1.5 and will be removed in 1.8.
+		)
 	else:
 		raise ValueError("classifier must be one of {'svm','logreg'}")
 
@@ -296,10 +313,17 @@ def build_pipeline(
 	])
 
 
+# Hold-out evaluation
 def evaluate_with_holdout(
-	pipe: Pipeline, X: np.ndarray, y: np.ndarray, test_size: float, random_state: int
+	pipe: Pipeline, 
+	X: np.ndarray, 
+	y: np.ndarray, 
+	test_size: float, 
+	random_state: int
 ) -> Tuple[float, str, np.ndarray]:
-	"""Train on a stratified hold-out split and return accuracy, report, and confusion matrix."""
+	"""
+	Train on a stratified hold-out split and return accuracy, report, and confusion matrix.
+	"""
 	X_train, X_test, y_train, y_test = train_test_split(
 		X,
 		y,
@@ -315,11 +339,22 @@ def evaluate_with_holdout(
 	return acc, report, cm
 
 
+# Cross-validation evaluation
 def evaluate_with_cv(
-	pipe: Pipeline, X: np.ndarray, y: np.ndarray, cv: int, random_state: int
+	pipe: Pipeline, 
+	X: np.ndarray, 
+	y: np.ndarray, 
+	cv: int, 
+	random_state: int
 ) -> Tuple[float, float, np.ndarray]:
-	"""Run stratified K-fold cross validation and return mean, std, and per-fold scores."""
-	skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_state)
+	"""
+ 	Run stratified K-fold cross validation and return mean, std, and per-fold scores.
+	"""
+	skf = StratifiedKFold(
+			n_splits=cv, 
+			shuffle=True, 
+			random_state=random_state
+		)
 	scores = cross_val_score(pipe, X, y, cv=skf, scoring="accuracy", n_jobs=-1)
 	return float(scores.mean()), float(scores.std()), scores
 
@@ -351,6 +386,9 @@ def parse_args() -> argparse.Namespace:
 	# Classifier selection
 	parser.add_argument("--classifier", type=str, choices=["svm", "logreg"], default="svm", help="Classifier type: svm | logreg (default: svm)")
 	parser.add_argument("--C", type=float, default=1.0, help="LinearSVC regularization parameter C (ignored if logreg)")
+	parser.add_argument("--logreg-C", type=float, default=1.0, help="LogisticRegression inverse regularization strength C (only if classifier=logreg)")
+	parser.add_argument("--logreg-max-iter", type=int, default=1000, help="LogisticRegression max iterations (only if classifier=logreg)")
+	parser.add_argument("--logreg-solver", type=str, default="lbfgs", choices=["lbfgs","liblinear","saga","newton-cg"], help="LogisticRegression solver (only if classifier=logreg)")
 	# Persistence
 	parser.add_argument("--save-model", action="store_true", help="Persist trained pipeline after training")
 	parser.add_argument(
@@ -374,19 +412,25 @@ def main() -> None:
 	X, y = load_dataset(args.data_path)
 	print(f"Loaded {len(X)} samples across {len(set(y))} unique labels.")
 
-	# Build pipeline (feature extractor + classifier)
+	# Typical two-stage process of machine learning:
+	# - Feature extraction + classifier
+	# Build pipeline
+	# Two options: 'TF-IDF + classifier' OR 'BERT embeddings + classifier'
 	pipe = build_pipeline(
 		use_char_ngrams=args.use_char_ngrams,
 		ngram_min=args.ngram_min,
 		ngram_max=args.ngram_max,
 		max_features=args.max_features,
-		C=args.C,
-		classifier=args.classifier,
 		use_bert=args.use_bert,
 		bert_model_name=args.bert_model_name,
 		bert_max_length=args.bert_max_length,
 		bert_batch_size=args.bert_batch_size,
 		bert_mean_pool=args.bert_mean_pool,
+		classifier=args.classifier,
+		C=args.C,
+		logreg_C=args.logreg_C,
+		logreg_max_iter=args.logreg_max_iter,
+		logreg_solver=args.logreg_solver,
 	)
 
 	mode_desc = (
@@ -417,6 +461,9 @@ def main() -> None:
 		bert_max_length=args.bert_max_length,
 		bert_batch_size=args.bert_batch_size,
 		bert_mean_pool=args.bert_mean_pool,
+		logreg_C=args.logreg_C,
+		logreg_max_iter=args.logreg_max_iter,
+		logreg_solver=args.logreg_solver,
 	)
 	mean_acc, std_acc, scores = evaluate_with_cv(
 		pipe_cv, X, y, cv=args.cv, random_state=args.random_state
@@ -431,7 +478,6 @@ def main() -> None:
 	# Optionally persist the trained hold-out model
 	if args.save_model:
 		ensure_dir(args.output_dir)
-		model_path = os.path.join(args.output_dir, "text_classifier_tfidf_svm.joblib")
 		# Refit on full data for final model
 		pipe_final = build_pipeline(
 			use_char_ngrams=args.use_char_ngrams,
@@ -445,6 +491,9 @@ def main() -> None:
 			bert_max_length=args.bert_max_length,
 			bert_batch_size=args.bert_batch_size,
 			bert_mean_pool=args.bert_mean_pool,
+			logreg_C=args.logreg_C,
+			logreg_max_iter=args.logreg_max_iter,
+			logreg_solver=args.logreg_solver,
 		)
 		pipe_final.fit(X, y)
 		# Adjust filename suffix based on mode
@@ -461,4 +510,3 @@ def main() -> None:
 
 if __name__ == "__main__":
 	main()
-
