@@ -6,7 +6,7 @@
 - 预训练表示: BERT 句向量（CLS / Mean Pool） + 线性分类器（LinearSVC / LogisticRegression）
 
 数据文件格式：CSV 或 JSONL。要求包含两列/字段：
-- `label`：类别标签（整数，目标预期 0..9，但当前数据中有 11 类）
+- `label`：类别标签（整数，当前数据中有 11 类）
 - `text`：文本内容（中文描述）
 
 脚本输出包括：
@@ -34,7 +34,7 @@
 根据参数选择：
 - 若 `use_bert=True`：Pipeline = `[('embed', BertEncoder), ('clf', classifier)]`
 - 否则：
-  - 分词路径：结巴分词或字符 n-gram。
+  - 分词路径：jieba分词或字符 n-gram。
   - TF-IDF 特征：`TfidfVectorizer`（可控 n-gram 与 `max_features`）。
   - 分类器：`LinearSVC(C)` 或 `LogisticRegression(C, solver, max_iter)`。
 
@@ -167,7 +167,7 @@ pip install -r requirements.txt
 
 ## 10. 快速验证与调参示例
 ```bash
-# 基线：结巴 + SVM
+# 基线：jieba + SVM
 ./module/module_01/src/Assignment_1_NLP/text_classification.py
 
 # BERT + SVM 提升表示能力
